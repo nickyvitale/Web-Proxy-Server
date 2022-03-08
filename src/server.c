@@ -6,6 +6,7 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/time.h>
+#include <signal.h>
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <ctype.h>
@@ -21,14 +22,22 @@
 #define BUFFSIZE 100
 #define MAXLINE 5000
 #define NUMSITES 10
+
+// Global Variables
+char *forbSitesFileName;
 char **forbSites;
 int forbSitesLength;
 
+pthread_mutex_t logMutex;
+pthread_mutex_t updateSites;
+
+// Structure used to pass args to threads
 struct threadArgs{
-	char *accessLogPath;
-	int fd;
+	int accessLog; // descriptor access log (output file)
+	int fd; // descriptor for the connection received from accept
 };
 
+// Returns 1 if string composed of only digits, 0 else
 int isNumeric(char* num){
 	for (int i = 0; i < num[i] != '\0'; i++){
                 if (!isdigit(num[i])){
@@ -38,6 +47,7 @@ int isNumeric(char* num){
 	return 1;
 }
 
+// Valid ports must be numeric and within the range [1024, 65535]
 int isValidPort(char *port){
 	if (isNumeric(port)){
         	if (atoi(port) >= 1024 && atoi(port) <= 65535){
@@ -47,6 +57,7 @@ int isValidPort(char *port){
 	return 0;
 }
 
+// Same as isValidPort, except used to verify the web port (so can access reserved ports)
 int isValidWebPort(char *port){
 	if (isNumeric(port)){
                 if (atoi(port) >= 0 && atoi(port) <= 65535){
@@ -56,10 +67,110 @@ int isValidWebPort(char *port){
         return 0;	
 }
 
+void constructForbSites(){
+	pthread_mutex_lock(&updateSites);
+	int numSites = NUMSITES;
+	int forbSitesIndex = 0;
+	forbSites = malloc(numSites*sizeof(char*));
+	FILE *forbSitesFile = fopen(forbSitesFileName, "r");
+	if (forbSitesFile == NULL) {
+      		fprintf(stderr, "Couldn't open forbidden sites file\n");
+     		exit(1);
+  	}
+	
+	char buffer[MAXLINE];
+	while(fgets(buffer, MAXLINE, forbSitesFile) != NULL){
+		if (forbSitesIndex == numSites){
+			numSites *= 2;
+			char **newSitesBuff = realloc(forbSites, numSites*sizeof(char*));
+			if(newSitesBuff != NULL){
+				forbSites = newSitesBuff;
+			}
+			else{
+				fprintf(stderr, "Couldn't reallocate to shrink forbidden sites list\n");
+				exit(1);
+			}
+		}
+		forbSites[forbSitesIndex] = strdup(buffer);
+		forbSites[forbSitesIndex][strlen(buffer)-1] = '\0'; // Remove the \n
+		forbSitesIndex++;
+	}
+	fclose(forbSitesFile);
+	// Resize list once more (shrink to size of elements read in)
+	forbSitesLength = forbSitesIndex;
+	char **newSitesBuff = realloc(forbSites, forbSitesLength*sizeof(char*));
+	if(newSitesBuff != NULL){
+		forbSites = newSitesBuff;
+	}
+	else{
+		fprintf(stderr, "Couldn't reallocate to shrink forbidden sites list\n");
+		exit(1);
+	}
+	pthread_mutex_unlock(&updateSites);
+}
+
+// Checks if a domain name starts with "www." 
+// Returns 1 if so, returns 0 otherwise
+int hasWWW(char *domainName){
+	if (strlen(domainName) <= 4) return 0;
+	if(domainName[0] != 'w' && domainName[0] != 'W') return 0;
+	if (domainName[1] != 'w' && domainName[1] != 'W') return 0;
+	if (domainName[2] != 'w' && domainName[2] != 'W') return 0;	
+	if (domainName[3] != '.') return 0;	
+	
+	return 1;
+}
+
+// This function is used to terminate a thread
 void terminateThread(struct threadArgs *args){
-	close(args->fd);
-	free(args);
+	close(args->fd); // Close fd that was created for this thread by accept() in main
+	free(args); // Free arguments struct allocated for this thread by main
 	pthread_exit(NULL);
+}
+
+// This function sends HTTP responses to the client
+// This is only used when some sort of "error" type response gets sent, like 400, etc.
+// Thus the content will always be an http page that just displays the error
+// Return value: Length of Content
+int sendHttpResponse(int responseCode, char *responseStatus, char *dateHeader, struct threadArgs *args){
+	char content[MAXLINE]; 
+	sprintf(content, "<!DOCTYPE html>\n"
+        "<html>\n"
+        "%d %s\n"
+        "</html>\n", responseCode, responseStatus);
+
+	char reply[MAXLINE];
+	sprintf(reply, "HTTP/1.1 %d %s\r\n"
+	"Content-Length: %d\r\n"
+	"Content-Type: text/html; charset=UTF-8\r\n"
+	"Date: %s\r\n"
+	"\r\n"
+	"%s", responseCode, responseStatus, strlen(content), dateHeader, content);
+
+	write(args->fd, reply, strlen(reply));
+
+	return strlen(content);
+}
+
+// This function is used to record to the access log file
+// Called by threads, therefore (if error) should exit using terminateThread function
+void logAccess(char *timeOfAccess, char *clientIP, char *requestLine, int responseCode, int contentSize, struct threadArgs *args){
+	pthread_mutex_lock(&logMutex);
+	char log[MAXLINE];
+	sprintf(log, "%s %s %s %d %d\n", timeOfAccess, clientIP, requestLine, responseCode, contentSize);	
+	if (write(args->accessLog, log, strlen(log)) < 0){
+		fprintf(stderr, "Couldn't write to file for access log\n");
+		terminateThread(args);
+	}
+	pthread_mutex_unlock(&logMutex);
+}
+
+void sighandler(int signum){
+	for(int i = 0; i < forbSitesLength; i++){
+                free(forbSites[i]);
+        }
+        free(forbSites);
+	constructForbSites();
 }
 
 // This function handles client requests, and is essentially the "main" function for threads
@@ -83,9 +194,15 @@ void *reqHandler(void *arg){
 	// For HTTP Response Headers
 	strftime(dateHeader, sizeof dateHeader - 1, "%a, %d %b %Y %H:%M:%S %Z", timeStruct);
 
-	// Setup for buffers to read from client
+	// Get client IP (used later in multiple places)
+	struct sockaddr_in cliaddr;
+	socklen_t lenCliaddr;
+	getsockname(args->fd, (struct sockaddr *)&cliaddr, &lenCliaddr);
+	char *clientIp = strdup(inet_ntoa(cliaddr.sin_addr));
+
+	// Setup buffers to read from client
 	int bufSize = BUFFSIZE;
- 	char *buffer[BUFFSIZE];
+ 	char buffer[BUFFSIZE];
 	char *clientRequest = (char *)malloc(bufSize*sizeof(char));
 	int r;
 	int bytesRead = 0;
@@ -122,76 +239,71 @@ void *reqHandler(void *arg){
 	clientRequest[bytesRead] = '\0';
 
 	// Parse request in order to create new request to the web server
-	strtok(clientRequest, "\n"); // Get first line of that field
-	char *requestType = strtok(clientRequest, " "); // GET or HEAD, etc
+	char *reserve;
+	strtok_r(clientRequest, "\n", &reserve); // Get first line of that field
+	char *requestType = strtok_r(clientRequest, " ", &reserve); // GET or HEAD, etc
 
-	char *secondField = strtok(NULL, " "); 
+	char *secondField = strtok_r(NULL, " ", &reserve); 
 	char secondRemoveFront[100];
-	memcpy(&secondRemoveFront, &secondField[7], strlen(secondField) - 7);
+	memcpy(&secondRemoveFront, &secondField[7], strlen(secondField) - 7); // Shaves off "http://"
+	secondRemoveFront[strlen(secondField) - 7] = '\0';
 
-	char *domainName = strtok(secondRemoveFront, "/");
-	char *docPath = strtok(NULL, "\0");
+	char *domainName = strtok_r(secondRemoveFront, "/", &reserve); // Separates the hostname and port from the path (gets host:port)
+	char *docPath = strtok_r(NULL, "/", &reserve); // Gets the path
 	if (docPath == NULL){
 		docPath = "";
 	}
-	strtok(domainName, ":");
-	char *port = strtok(NULL, "\0");
-	if (port == NULL){
+	strtok_r(domainName, ":", &reserve); // Separates the hostname and port
+	char *port = strtok_r(NULL, ":", &reserve); // Gets port
+	if (port == NULL){ // If no ":" was there to specify a port, assign default port
 		port = "443";
 	}
 
-	// Next, some validation
-	if (!isValidWebPort(port)){ // send 400 Response and exit thread
-		char reply[MAXLINE];
-		sprintf(reply, "HTTP/1.1 400 Bad Request\r\n"
-		"Content-Length: 47\r\n"
-		"Content-Type: text/html; charset=UTF-8\r\n"
-		"Date: %s\r\n"
-		"\r\n"
-		"<!DOCTYPE html>\n"
-		"<html>\n"
-		"400 Bad Request\n"
-		"</html>\n", dateHeader);
-		write(args->fd, reply, strlen(reply));
+	// Next, some validation, with error responses as necessary
+
+	char requestLine[MAXLINE]; // For writing to access log
+	sprintf(requestLine, "\"%s /%s HTTP/1.1\"", requestType, docPath);
+
+	// If not a valid port
+	if (!isValidWebPort(port)){ 
+		int contentLen = sendHttpResponse(400, "Bad Request", dateHeader, args);
+		logAccess(nowStringMS, clientIp, requestLine, 400, contentLen, args);
 		terminateThread(args);
 	}
 
-	struct hostent *hostInfo;
+	// If IP/Hostname on forbidden list
+	struct hostent *hostInfo; // First have to get the IP Address from the host name
 	if ((hostInfo = gethostbyname(domainName)) == NULL){
 		fprintf(stderr, "Couldn't resolve IP Address from given domain name\n");
 		terminateThread(args);
 	}
-	char *ipDottedDecimal = inet_ntoa(*(struct in_addr *)hostInfo->h_addr);	
+	
+	char *ipDottedDecimal = strdup(inet_ntoa(*(struct in_addr *)hostInfo->h_addr));
+	char altDomainName[strlen(domainName) + 4]; // Next, check if domainName has "www." in it or not
+	if (hasWWW(domainName)){ // If www is there, make alternate domainName without it
+		memcpy(&altDomainName, &domainName[4], strlen(domainName) - 4);
+		altDomainName[strlen(domainName) - 4] = '\0'; 
+	}
+	else{ // If www is not there, make alternate domainName with it
+		sprintf(altDomainName, "www.%s", domainName);
+	}
+	pthread_mutex_lock(&updateSites);
 	for (int i = 0; i < forbSitesLength; i++){
-		if (strcmp(forbSites[i], domainName) == 0 || strcmp(forbSites[i], ipDottedDecimal) == 0){
-			char reply[MAXLINE];
-			sprintf(reply, "HTTP/1.1 403 Forbidden\r\n"
-	                "Content-Length: 45\r\n"
-			"Content-Type: text/html; charset=UTF-8\r\n"
-                	"Date: %s\r\n"
-			"\r\n"
-			"<!DOCTYPE html>\n"
-                	"<html>\n"
-                	"403 Forbidden\n"
-               		"</html>\n", dateHeader);
-        	        write(args->fd, reply, strlen(reply));
-              		terminateThread(args);
+		if (strcasecmp(forbSites[i], domainName) == 0 || strcasecmp(forbSites[i], ipDottedDecimal) == 0
+		    || strcasecmp(forbSites[i], altDomainName) == 0 ){
+			int contentLen = sendHttpResponse(403, "Forbidden", dateHeader, args);
+			logAccess(nowStringMS, clientIp, requestLine, 403, contentLen, args);
+			pthread_mutex_unlock(&updateSites);
+           		terminateThread(args);
 		}
 	}
-		
+	pthread_mutex_unlock(&updateSites);	
+
+	// If not a GET or HEAD request	
 	if (strcmp(requestType, "GET") != 0 && strcmp(requestType, "HEAD") !=0){
-		char reply[MAXLINE];
-		sprintf(reply, "HTTP/1.1 501 Not Implemented\r\n"
-                "Content-Length: 51\r\n"
-		"Content-Type: text/html; charset=UTF-8\r\n"
-                "Date: %s\r\n"
-                "\r\n"
-                "<!DOCTYPE html>\n"
-                "<html>\n"
-                "501 Not Implemented\n"
-                "</html>\n", dateHeader);
-                write(args->fd, reply, strlen(reply));
-                terminateThread(args);
+		int contentLen = sendHttpResponse(501, "Not Implemented", dateHeader, args);
+		logAccess(nowStringMS, clientIp, requestLine, 501, contentLen, args);
+		terminateThread(args);
 	}
 
 	// Begin Process of Connecting to Web Server
@@ -253,14 +365,14 @@ void *reqHandler(void *arg){
                 terminateThread(args);
 	}
 
-	// Read response from web server
+	// Read response from web server (reusing some variables used to buffer original request read from client)
 	bufSize = BUFFSIZE; // Size of the webResponse's buffer
-	bytesRead = 0; // Counter tracking how many bytes read
-	buffer[0] = '\0'; // Resets buffer used earlier to prevent buffer overflow
+	bytesRead = 0; // Counter that tracks how many bytes read
+	memset(&buffer, 0, sizeof(buffer)); // Resets buffer used earlier to prevent buffer overflow
 	
 	char *webResponse = (char*)malloc(bufSize*sizeof(char));
 	while ((r = SSL_read(ssl, buffer, BUFFSIZE)) > 0){		
-		if (bytesRead + r >= bufSize){
+		if (bytesRead + r > bufSize){
 			bufSize *= 2;
 			char *reallocWebResponse = (char*)realloc(webResponse, bufSize*sizeof(char));
 			if (reallocWebResponse != NULL){
@@ -275,16 +387,33 @@ void *reqHandler(void *arg){
 		bytesRead += r;
 	}
 	webResponse[bytesRead] = '\0';
-	
+
 	// Write response back to client
 	if ((write(args->fd, webResponse, bytesRead)) < 0){
 		fprintf(stderr, "Couldn't write response to client\n");
 		terminateThread(args);
 	}
 	
+	// Parse response for response code and content length, then log it
+	char *responseContent = strstr(webResponse, "\r\n\r\n");
+	int contentLength = strlen(responseContent) - 4; // Size of (content + "\r\n\r\n") - "\r\n\r\n"
+	if (responseContent == NULL){
+		contentLength = 0; // Likely something wrong with the web server's response
+	}
+	
+	strtok_r(webResponse, " ", &reserve); // get rid of the HTTP\1.1
+	char *responseCode = strtok_r(NULL, " ", &reserve); // get the status code
+	if (responseCode == NULL){
+		responseCode = 0; //Likely something wrong with the web server's response
+	}
+
+	logAccess(nowStringMS, clientIp, requestLine, atoi(responseCode), contentLength, args);
+
 	// End program
 	free(webResponse);
 	free(clientRequest);
+	free(ipDottedDecimal);
+	free(clientIp);
 	close(webServerFd);
 	SSL_shutdown(ssl);
 	SSL_free(ssl);
@@ -304,44 +433,17 @@ int main(int argc, char *argv[]){
 	}
 	
 	// Start main code
+
 	// Populate the forbidden sites list
-	int numSites = NUMSITES;
-	int forbSitesIndex = 0;
-	forbSites = (char**)malloc(numSites*sizeof(char*));
-	FILE *forbSitesFile = fopen(argv[2], "r");
-	if (forbSitesFile == NULL) {
-      		fprintf(stderr, "Couldn't open forbidden sites file\n");
-     		exit(1);
-  	}
-	
-	char buffer[MAXLINE];
-	while(fgets(buffer, MAXLINE, forbSitesFile) != NULL){
-		if (forbSitesIndex == numSites){
-			numSites *= 2;
-			char **newSitesBuff = (char**)realloc(forbSites, numSites*sizeof(char*));
-			if(newSitesBuff != NULL){
-				forbSites = newSitesBuff;
-			}
-			else{
-				fprintf(stderr, "Couldn't reallocate to shrink forbidden sites list\n");
-				exit(1);
-			}
-		}
-		forbSites[forbSitesIndex] = strdup(buffer);
-		forbSites[forbSitesIndex][strlen(buffer)-1] = '\0'; // Remove the \n
-		forbSitesIndex++;
-	}
-	fclose(forbSitesFile);
-	// Resize list once more (shrink to size of elements read in)
-	forbSitesLength = forbSitesIndex;
-	char **newSitesBuff = (char**)realloc(forbSites, forbSitesLength*sizeof(char*));
-	if(newSitesBuff != NULL){
-		forbSites = newSitesBuff;
-	}
-	else{
-		fprintf(stderr, "Couldn't reallocate to shrink forbidden sites list\n");
+	forbSitesFileName = argv[2];
+	if(pthread_mutex_init(&updateSites, NULL)){
+		fprintf(stderr, "Couldn't initialize mutex for forbidden-site updates\n");
 		exit(1);
 	}
+	constructForbSites();	
+
+	// Redirect termination signal to sighandler function
+	signal(SIGINT, sighandler);
 
 	// Create socket file descriptor
 	int sockfd;
@@ -354,8 +456,8 @@ int main(int argc, char *argv[]){
 	struct sockaddr_in servaddr;
 	servaddr.sin_family = AF_INET;
 	servaddr.sin_addr.s_addr = htonl(INADDR_ANY);
-	servaddr.sin_port = htons(atoi(argv[1]));
-	
+	servaddr.sin_port = htons(atoi(argv[1]));	
+
 	// Bind socket to the address assigned above
 	if (bind(sockfd, (const struct sockaddr *)&servaddr, sizeof(servaddr)) < 0){
 		fprintf(stderr, "Couldn't bind\n");
@@ -369,9 +471,19 @@ int main(int argc, char *argv[]){
 	}
 
 	// Going to loop infinitely in order to accept connections from clients
+	int connectfd;
+	if(pthread_mutex_init(&logMutex, NULL) != 0){
+		fprintf(stderr, "Couldn't initialize log mutex\n");
+		exit(1);
+	}
+	
 	struct sockaddr_in cliaddr;
 	socklen_t len;
-	int connectfd;
+	int accessLog;
+	if ((accessLog = open(argv[3],  O_WRONLY | O_APPEND | O_CREAT, 0666)) < 0){
+		fprintf(stderr , "Failed to open access log\n");
+		exit(1);
+	}
 	while (1){
 		len = sizeof(cliaddr);
 		connectfd = accept(sockfd, (struct sockaddr *)&cliaddr, &len);
@@ -382,9 +494,8 @@ int main(int argc, char *argv[]){
 		}
 		// Make thread to handle this connection	
 		struct threadArgs *args = (struct threadArgs*)malloc(sizeof(struct threadArgs));
-		args->accessLogPath = argv[3];
+		args->accessLog = accessLog;
 		args->fd = connectfd;
-
 		pthread_t thread;
 		if (pthread_create(&thread, NULL, reqHandler, args) < 0){
 			fprintf(stderr, "Couldn't create thread\n");
@@ -394,6 +505,9 @@ int main(int argc, char *argv[]){
 
 	// End main (but will never reach here since server is infinite loop)
 	close(sockfd);
+	close(accessLog);
+	pthread_mutex_destroy(&logMutex);
+	pthread_mutex_destroy(&updateSites);
 	for(int i = 0; i < forbSitesLength; i++){
 		free(forbSites[i]);
 	}
