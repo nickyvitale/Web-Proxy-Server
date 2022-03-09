@@ -264,6 +264,13 @@ void *reqHandler(void *arg){
 	char requestLine[MAXLINE]; // For writing to access log
 	sprintf(requestLine, "\"%s /%s HTTP/1.1\"", requestType, docPath);
 
+	// If not a GET or HEAD request	
+	if (strcmp(requestType, "GET") != 0 && strcmp(requestType, "HEAD") !=0){
+		int contentLen = sendHttpResponse(501, "Not Implemented", dateHeader, args);
+		logAccess(nowStringMS, clientIp, requestLine, 501, contentLen, args);
+		terminateThread(args);
+	}
+
 	// If not a valid port
 	if (!isValidWebPort(port)){ 
 		int contentLen = sendHttpResponse(400, "Bad Request", dateHeader, args);
@@ -299,13 +306,6 @@ void *reqHandler(void *arg){
 	}
 	pthread_mutex_unlock(&updateSites);	
 
-	// If not a GET or HEAD request	
-	if (strcmp(requestType, "GET") != 0 && strcmp(requestType, "HEAD") !=0){
-		int contentLen = sendHttpResponse(501, "Not Implemented", dateHeader, args);
-		logAccess(nowStringMS, clientIp, requestLine, 501, contentLen, args);
-		terminateThread(args);
-	}
-
 	// Begin Process of Connecting to Web Server
 	
 	// Create socket for web server
@@ -319,7 +319,7 @@ void *reqHandler(void *arg){
 	webserver.sin_family = AF_INET;
 	webserver.sin_port = htons(atoi(port));
 	webserver.sin_addr.s_addr = *(in_addr_t *)hostInfo->h_addr;
-
+	
 	if((connect(webServerFd, (struct sockaddr *) &webserver, sizeof(webserver)) < -1)){
 		fprintf(stderr, "Couldn't connect socket to web server\n");
 		terminateThread(args);
@@ -357,7 +357,6 @@ void *reqHandler(void *arg){
 	}
 	
 	// Make request to web server
-
 	char reqToWeb[MAXLINE];
 	sprintf(reqToWeb, "%s /%s HTTP/1.1\r\nHost: %s\r\n\r\n", requestType, docPath, domainName);
 	if ((SSL_write(ssl, reqToWeb, strlen(reqToWeb))) < 0){
@@ -386,6 +385,7 @@ void *reqHandler(void *arg){
 		memcpy(&webResponse[bytesRead], &buffer, r);
 		bytesRead += r;
 	}
+	
 	webResponse[bytesRead] = '\0';
 
 	// Write response back to client
