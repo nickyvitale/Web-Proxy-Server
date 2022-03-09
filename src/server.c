@@ -218,7 +218,7 @@ void *reqHandler(void *arg){
 	while (poll(fds, 1, timeout) != 0){
 		if ((r = read(args->fd, buffer, BUFFSIZE)) < 0){
 			fprintf(stderr, "Error reading\n");
-			terminateThread(args);
+			exit(1);
 		}
 		
 		if (bytesRead + r > bufSize){ // Must reallocate buffer
@@ -229,7 +229,7 @@ void *reqHandler(void *arg){
 			}
 			else {
 				fprintf(stderr, "Couldn't reallocate buffer\n");
-				terminateThread(args);
+				exit(1);
 			}
 		}
 
@@ -244,10 +244,15 @@ void *reqHandler(void *arg){
 	char *requestType = strtok_r(clientRequest, " ", &reserve); // GET or HEAD, etc
 
 	char *secondField = strtok_r(NULL, " ", &reserve); 
-	char secondRemoveFront[100];
-	memcpy(&secondRemoveFront, &secondField[7], strlen(secondField) - 7); // Shaves off "http://"
-	secondRemoveFront[strlen(secondField) - 7] = '\0';
-
+	char secondRemoveFront[MAXLINE];
+	if (strlen(secondField) >= 7){
+		memcpy(&secondRemoveFront, &secondField[7], strlen(secondField) - 7); // Shaves off "http://"
+		secondRemoveFront[strlen(secondField) - 7] = '\0';
+	}
+	else{
+		secondRemoveFront = "";	
+	}
+	
 	char *domainName = strtok_r(secondRemoveFront, "/", &reserve); // Separates the hostname and port from the path (gets host:port)
 	char *docPath = strtok_r(NULL, "/", &reserve); // Gets the path
 	if (docPath == NULL){
@@ -263,29 +268,32 @@ void *reqHandler(void *arg){
 
 	char requestLine[MAXLINE]; // For writing to access log
 	sprintf(requestLine, "\"%s /%s HTTP/1.1\"", requestType, docPath);
-
+	
 	// If not a GET or HEAD request	
 	if (strcmp(requestType, "GET") != 0 && strcmp(requestType, "HEAD") !=0){
 		int contentLen = sendHttpResponse(501, "Not Implemented", dateHeader, args);
 		logAccess(nowStringMS, clientIp, requestLine, 501, contentLen, args);
 		terminateThread(args);
 	}
-
-	// If not a valid port
-	if (!isValidWebPort(port)){ 
+	
+	// If one of the parsed fields is NULL, or invalid
+	if (domainName == NULL || requestType == NULL || !isValidWebPort(port)){
 		int contentLen = sendHttpResponse(400, "Bad Request", dateHeader, args);
 		logAccess(nowStringMS, clientIp, requestLine, 400, contentLen, args);
 		terminateThread(args);
 	}
 
-	// If IP/Hostname on forbidden list
+	// If domain name cannot be resolved
 	struct hostent *hostInfo; // First have to get the IP Address from the host name
-	if ((hostInfo = gethostbyname(domainName)) == NULL){
+	if ((hostInfo = gethostbyname(domainName)) == NULL){ 
 		fprintf(stderr, "Couldn't resolve IP Address from given domain name\n");
+		int contentLen = sendHttpResponse(404, "Not Found", dateHeader, args);
+		logAccess(nowStringMS, clientIp, requestLine, 404, contentLen, args);
 		terminateThread(args);
 	}
 	
-	char *ipDottedDecimal = strdup(inet_ntoa(*(struct in_addr *)hostInfo->h_addr));
+	// If on forbidden list
+	char *ipDottedDecimal = strdup(inet_ntoa(*(struct in_addr *)hostInfo->h_addr)); // Get IP of host name
 	char altDomainName[strlen(domainName) + 4]; // Next, check if domainName has "www." in it or not
 	if (hasWWW(domainName)){ // If www is there, make alternate domainName without it
 		memcpy(&altDomainName, &domainName[4], strlen(domainName) - 4);
@@ -312,7 +320,7 @@ void *reqHandler(void *arg){
 	int webServerFd; // This will be the socket that will be used to connect to the web server
 	if ((webServerFd = socket(AF_INET, SOCK_STREAM, 0)) < 0){
 		fprintf(stderr, "Couldn't create web server's socket\n");
-		terminateThread(args);
+		exit(1);
 	}
 
 	struct sockaddr_in webserver;
@@ -322,7 +330,7 @@ void *reqHandler(void *arg){
 	
 	if((connect(webServerFd, (struct sockaddr *) &webserver, sizeof(webserver)) < -1)){
 		fprintf(stderr, "Couldn't connect socket to web server\n");
-		terminateThread(args);
+		exit(1);
 	}
 
 	struct timeval tv; // timeout stuff
@@ -339,20 +347,28 @@ void *reqHandler(void *arg){
 	SSL_CTX *const ctx = SSL_CTX_new(req_method);
 	if (ctx == NULL) {
 		fprintf(stderr, "Couldn't create SSL context\n");
+		int contentLen = sendHttpResponse(503, "Service Temporarily Unavailable", dateHeader, args);
+		logAccess(nowStringMS, clientIp, requestLine, 503, contentLen, args);
 		terminateThread(args);
 	}
 
 	SSL* ssl;
 	if ((ssl = SSL_new(ctx)) == NULL){
 		fprintf(stderr, "Couldn't create new ssl\n");
+		int contentLen = sendHttpResponse(503, "Service Temporarily Unavailable", dateHeader, args);
+		logAccess(nowStringMS, clientIp, requestLine, 503, contentLen, args);
 		terminateThread(args);
 	}
 	if((SSL_set_fd(ssl, webServerFd)) == 0){
 		fprintf(stderr, "Couldn't set the fd for ssl\n");
+		int contentLen = sendHttpResponse(503, "Service Temporarily Unavailable", dateHeader, args);
+		logAccess(nowStringMS, clientIp, requestLine, 503, contentLen, args);
 		terminateThread(args);
 	}
 	if(SSL_connect(ssl) != 1){
 		fprintf(stderr, "Couldn't perform handshake for SSL\n");
+		int contentLen = sendHttpResponse(503, "Service Temporarily Unavailable", dateHeader, args);
+		logAccess(nowStringMS, clientIp, requestLine, 503, contentLen, args);
 		terminateThread(args);
 	}
 	
@@ -361,6 +377,8 @@ void *reqHandler(void *arg){
 	sprintf(reqToWeb, "%s /%s HTTP/1.1\r\nHost: %s\r\n\r\n", requestType, docPath, domainName);
 	if ((SSL_write(ssl, reqToWeb, strlen(reqToWeb))) < 0){
 		fprintf(stderr, "Couldn't write to SSL\n");
+		int contentLen = sendHttpResponse(503, "Service Temporarily Unavailable", dateHeader, args);
+		logAccess(nowStringMS, clientIp, requestLine, 503, contentLen, args);
                 terminateThread(args);
 	}
 
@@ -398,13 +416,17 @@ void *reqHandler(void *arg){
 	char *responseContent = strstr(webResponse, "\r\n\r\n");
 	int contentLength = strlen(responseContent) - 4; // Size of (content + "\r\n\r\n") - "\r\n\r\n"
 	if (responseContent == NULL){
-		contentLength = 0; // Likely something wrong with the web server's response
+		int contentLen = sendHttpResponse(503, "Service Temporarily Unavailable", dateHeader, args);
+		logAccess(nowStringMS, clientIp, requestLine, 503, contentLen, args);
+		terminateThread(args);
 	}
 	
 	strtok_r(webResponse, " ", &reserve); // get rid of the HTTP\1.1
 	char *responseCode = strtok_r(NULL, " ", &reserve); // get the status code
 	if (responseCode == NULL){
-		responseCode = 0; //Likely something wrong with the web server's response
+		int contentLen = sendHttpResponse(503, "Service Temporarily Unavailable", dateHeader, args);
+		logAccess(nowStringMS, clientIp, requestLine, 503, contentLen, args);
+		terminateThread(args);
 	}
 
 	logAccess(nowStringMS, clientIp, requestLine, atoi(responseCode), contentLength, args);
