@@ -409,7 +409,7 @@ void *reqHandler(void *arg){
 	// Write response back to client
 	if ((write(args->fd, webResponse, bytesRead)) < 0){
 		fprintf(stderr, "Couldn't write response to client\n");
-		terminateThread(args);
+		exit(1);
 	}
 	
 	// Parse response for response code and content length, then log it
