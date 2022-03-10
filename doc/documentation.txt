@@ -1,49 +1,39 @@
-In order to use this application, you must first run ./make in the top most directory. This will create two executable binary files: myclient and myserver. As the names suggest, one is a UDP client and the other is a UDP server. The main functionality of this application is to have the client send the contents of a file to the server, and have the server save the contents into a new output file, effectively creating a copy of the original file. It is conceptually similar to the echo application, the main difference being that this time, the server is the one completing the reconstruction of the outfile.
+In order to use this application, you must first run ./make in the top most directory. This will create an executable binary file: myproxy. As the name suggests, it is a TCP web proxy server. It's main functionality is to accept http 1.1 requests from clients using a multithreaded model and to convert them to https requests and sending them to the appropriate web server. Likewise, the proxy must forward the response it receives from the web server back to the original client. 
 
 The proper way to run the server (from the top directory) is:
-./bin/myserver portnumber droppc root_folder_path
-Where the port number should be between 1024-65535, the droppc is the percentage of packets to be dropped intentionally by the server, and the root_folder_path is the name of the directory under which the server should save the replicated file.
+./bin/mysproxy portnumber forbiddenFilePath accessLogPath
+Where the port number should be between 1024-65535, the forbiddenFilePath is the path to a text file that contains a list of forbidden sites, and the accessLogPath is the name of the file that will store an information log for each completed request.
 
-Likewise, the proper way to run the client is:
-./bin/myclient #servers serv.config mtu infilepath outfilepath
-The #servers is the amount of servers that should replicate the file, the serv.config is the name of a file that contains a list of servers' ip addresses and port numbers that the client should access in order to know how to contact each server, the mtu refers to the maximum packet size that can be sent, the winsz is the number of packets allowed to be in transmit from client to server at a given time, and the infile and outfile paths refer to the paths that direct to the file that should be echoed and the file that should have the copy written to it, respectively.
+The access log has entries in the following form:
+Timestamp clientIP firstLineOfRequest responseCode contentSize
 
-For the design completed in Lab 3:
-The design that I decided on was to read the infile into a buffer, attach sequence numbers to each packet, and then to send each packet over to the server. In order to make sure that problems such as packet loss and out of order packets did not affect the server's ability to reconstruct the file properly, I implemented a reliable protocol known as Go Back N. In essence, the client sends out winsz number of packets to the server and waits for the server to acknowledge each one. If an ack is not received by the server (a timeout will occur in this case), each of the currently "in-transmit" packets is resent (starting from the first one that was not acknowledged). In terms of what the server does, it just checks the sequence number of every packet it receives, and only sends an ack if its the correct sequence number that is to be expected for the next arrival.
+Design of application:
+The main function of the application is an infinite loop that uses accept() to accept connections from clients, and then handles each connection by creating a thread for each one. Inside the function that each thread executes, first the request from the client is read into a buffer. Then, it is parsed for the port, host name, document path, and request type (GET, etc). With that information, the proxy then determines whether or not the request is legal by checking the list of forbidden sites against the host name given in the request. Additionally, there is lots of verification for misformatting, etc. After the verification is complete, the proxy needs to send the request to the web server. In order to do this, the OpenSSL library is used. This library basically allows the proxy to reach the web server with the TLS protocol (basically secures/protects the communication). After sending the request to the web server, the proxy reads the response, and sends it back to the client. Finally, a line is written to the log that stores essential information about the handled request.
 
-For the additions made in Lab 4:
-In Lab 4, I basically just used the same exact design as Lab 3, but implemented threading on the client side so that the client could concurrently deal with multiple servers. This was done very simply using the Pthreads library, and essentially each thread that I create in the client's main function just runs the client code from Lab 3. Each thread is given a struct with information that otherwise would have been passed directly into the client by command line arguments (ip, port, mtu, etc). Then, the thread uses this information to essentially operate just like the code did in Lab 3. 
-Additionally, on the server side, I had to account for the new variable, root_folder_path. The main purpose of having this argument added into Lab 4 was so that each separate server could save their replicated file in separate directories such that they would not overwrite each other (since in Lab 3, only the outfile_path received from the client determined where the server would save the replicated file). In order to account for this new field, I had to check whether the root directory already existed, and if it didn't, I had to create it (including nested directories). Then, I also had to account for the outfile_path received from the client as basically a continuation of the path begun by the root_folder_path, since the outfile_path can also potentially contain directories.
+Another thing that must be noted is that the list of forbidden sites can be updated during the server's lifecycle. In order to do so, alter the file containing the list of servers, and then click Control-C in the terminal in which the server is running. This will trigger a SIGINT signal to the server, which will subsequently run a function that destroys and recreates the list of forbidden sites from scratch. In order to make sure that there are no concurrency issues, a mutex is used to verify that the forbidden sites list is not being accessed by any thread when this update occurs.
 
 Test Cases:
-The first test is to just run the functionality for one server. This is essentially just to test that the functionality works for Lab 3. The following lines of code execute this test case:
+The first test is to just run a simple wget request. This is essentially just to test that the main functionality works. The following lines of code execute this test case:
 
-./bin/myserver 9000 0 this
-./bin/myclient 1 serv.config 100 10 README.txt output.txt
+./bin/myproxy 9000 forbSites log.txt 
+wget www.example.com -e use_proxy=yes -e http_proxy=127.0.0.1:9000
 
-2.) The second test case is to not run any servers before the client. In this case, the client should not be able to reach the servers, and ultimately should time out due to the timer that was implemented. The following line of code will execute this test case (assuming server is off).
+2.) The second test case is to see what happens when an invalid port is given in the request. The point of this is to test the verifying mechanism. The expected response is a 400 Bad Request response.
 
-./bin/myclient 1 serv.config 100 10 README.txt output.txt
+./bin/myproxy 9000 forbSites log.txt 
+curl -x http://127.0.0.1:9000/ http://www.example.com:badport
 
-3.) The third test case is for when the mtu is too small. Since the header is 4 bytes, the mtu must be greater than 4 in order for any data to be transmitted. Thus, this test case should result in error and graceful termination:
+3.) The third test case is for when the https:// is used in the request instead of http://. The main purpose of this is to test that the program will properly respond to a method other than GET or HEAD (since only those two are supported by the proxy server). The expected result is a 501 Not Implemented response.
 
-./bin/myserver 9000 0 this
-./bin/myclient 1 serv.config 4 10 empty.txt output.txt
+./bin/myproxy 9000 forbSites log.txt 
+curl -x http://127.0.0.1:9000/ https://www.example.com
 
-4.) The fourth test was to run the server with a droppc of 50. In this case, it is very likely that the client will end up gracefully terminating, as there are likely to be packets that get resubmitted the maximum of 5 times.
+4.) The fourth test is to request a site that is included in the forbidden sites file. This should result in a 403 Forbidden response. Likewise, after removing the site from the forbidden sites file and clicking control-c on the server's terminal, one should be able to re-run the same request and this time get a non-forbidden response.
 
-./bin/myserver 9000 50 this
-./bin/myclient 1 serv.config 5 10 README.txt output.txt
+./bin/myproxy 9000 forbSites log.txt 
+curl -x http://127.0.0.1:9000/ www.someforbiddensite.com
 
-5.) The fifth test was for a very large window size. Additionally, in this test, two servers will be run in order to test the thread functionality. In this case, very many packets can be in transmit at once since the window is very large.
+5.) The fifth test is to input an invalid request, in which either the host cannot be resolved or the file path doesn't exist. The expected result is a 404 Not Found response.
 
-./bin/myserver 9000 0 this
-./bin/myserver 9001 0 that
-./bin/myclient 2 serv.config 10 1000 README.txt output.txt
-
-6.) The sixth test was to run the application on a binary infile. Aditionally, in this test, three servers will be run in order to test thread functionality. In this case, the application is expected to function as normal. The following lines execute the test.
-
-./bin/myserver 9000 0 this
-./bin/myserver 9001 0 that
-./bin/myserver 9003 0 thisorthat
-./bin/myclient 3 serv.config 10 100 ./bin/myserver outfile.txt
+./bin/myproxy 9000 forbSites log.txt 
+curl -x http://127.0.0.1:9000/ www.notarealsitetrollololololololololol.com
