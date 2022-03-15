@@ -244,13 +244,10 @@ void *reqHandler(void *arg){
 	char *requestType = strtok_r(clientRequest, " ", &reserve); // GET or HEAD, etc
 
 	char *secondField = strtok_r(NULL, " ", &reserve); 
-	char secondRemoveFront[MAXLINE];
+	char secondRemoveFront[MAXLINE] = "";
 	if (strlen(secondField) >= 7){
 		memcpy(&secondRemoveFront, &secondField[7], strlen(secondField) - 7); // Shaves off "http://"
 		secondRemoveFront[strlen(secondField) - 7] = '\0';
-	}
-	else{
-		secondRemoveFront = "";	
 	}
 	
 	char *domainName = strtok_r(secondRemoveFront, "/", &reserve); // Separates the hostname and port from the path (gets host:port)
