@@ -14,7 +14,7 @@ make = subprocess.Popen("make clean",shell=True,stdout=subprocess.PIPE,stderr=su
 make.communicate()
 make = subprocess.Popen("make",shell=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
 makeData = make.communicate()
-valid = subprocess.Popen("../valid.sh",shell=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+valid = subprocess.Popen("valid.sh",shell=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
 validData = valid.communicate()
 
 def getServerPid():
@@ -50,9 +50,9 @@ def switchBlockedWebsites(input):
 	time.sleep(1)
 	assert(0 <= input <= 2)
 	if input == 0:
-		proc = subprocess.Popen("cp ../sites-head block",shell=True)
+		proc = subprocess.Popen("cp sites-head block",shell=True)
 	elif input == 1:
-		proc = subprocess.Popen("cp ../sites-tail block",shell=True)
+		proc = subprocess.Popen("cp sites-tail block",shell=True)
 	elif input == 2:
 		proc = subprocess.Popen("touch block",shell=True)
 	proc.communicate()
@@ -108,7 +108,7 @@ def runTests(numServersStr):
 	resultsDict = {"name":sys.argv[1],"sid":sid}
 	resultsDict["make"] = makeData
 	resultsDict["valid"] = validData
-	s = "../diff_test.sh " + numServersStr + " " + sys.argv[2] + " data " + " ".join(sortedWeb)
+	s = "diff_test.sh " + numServersStr + " " + sys.argv[2] + " data " + " ".join(sortedWeb)
 	p = subprocess.Popen(s,shell=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
 	print("Running test:",s)
 	pData = p.communicate()
@@ -116,7 +116,7 @@ def runTests(numServersStr):
 	switchBlockedWebsites(0)
 	cleanDout()
 	sendCC()
-	s = "../neg_test.sh " + numServersStr + " " + sys.argv[2] + " data " + " ".join(sortedWeb)
+	s = "neg_test.sh " + numServersStr + " " + sys.argv[2] + " data " + " ".join(sortedWeb)
 	p = subprocess.Popen(s,shell=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
 	print("Running block test:",s)
 	pData = p.communicate()
@@ -124,7 +124,7 @@ def runTests(numServersStr):
 	switchBlockedWebsites(2)
 	cleanDout()
 	sendCC()
-	s = "../error_test.sh 1 " + sys.argv[2] +  " data unused"
+	s = "error_test.sh 1 " + sys.argv[2] +  " data unused"
 	p = subprocess.Popen(s,shell=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
 	print("Running error tests:",s)
 	pData = p.communicate()

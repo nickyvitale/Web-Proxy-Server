@@ -98,14 +98,6 @@ void constructForbSites(){
 	fclose(forbSitesFile);
 	// Resize list once more (shrink to size of elements read in)
 	forbSitesLength = forbSitesIndex;
-	char **newSitesBuff = realloc(forbSites, forbSitesLength*sizeof(char*));
-	if(newSitesBuff != NULL){
-		forbSites = newSitesBuff;
-	}
-	else{
-		fprintf(stderr, "Couldn't reallocate to shrink forbidden sites list\n");
-		exit(1);
-	}
 	pthread_mutex_unlock(&updateSites);
 }
 

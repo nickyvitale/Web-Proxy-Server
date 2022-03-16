@@ -41,7 +41,7 @@ for i in $(eval echo "{1..$1}")
 				echo Test $i Grade: 0
 			else
 				b=0
-				c=$(diff ../$i dout/$3$i | wc -l)
+				c=$(diff $i dout/$3$i | wc -l)
 				b=$(($b+$c))
 				if [ $b -gt 0 ]
 					then
